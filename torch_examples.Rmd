@@ -1,0 +1,578 @@
+---
+title: "Simple Torch Examples"
+author: "Aaron Miles"
+date: "10/1/2020"
+output: html_document
+---
+
+The only constants in life are death, taxes, and the RStudio team continually crushing it. This time, they've ported [Torch into R](https://blogs.rstudio.com/ai/posts/2020-09-29-introducing-torch-for-r/). I'm a fairly heavy `tensorflow` user, and coming from an R background had a steep learning curve incorporating it into my toolkit. While `torch` is simpler in a lot of ways (specifically, not requiring a python environment), these deep learning frameworks can be intimidating. What I hope to do here is demystify `torch` workflows a little bit by providing some overly simple use cases. Specifically, show regression and classification (binary and multiclass) models build with torch, and how to extract the correct output in order to feed into your model evaluation/post-modeling process. To be clear, I re-use a lot of the code from the vignettes and examples from [the torch package website](https://mlverse.github.io/torch/). They've done a great job, I just wanted to put my own spin on it in case it could be helpful to someone in the future.
+
+## Setup
+
+I'm going to keep dependencies to a minimum, so I'll only be using the `torch` and `palmerpenguins` libraries.
+
+```{r libraries, message=FALSE, error=FALSE, warning=FALSE}
+
+library(torch)
+library(palmerpenguins)
+
+```
+
+For each task I'll be using the `palmerpenguins` dataset. For sake of simplicity, I've just removed the cases that have missing values. There isn't a clear binary target variable, so I create one (flagging if the penguin is of the Adelie species). I also create a train/test split
+
+```{r dataprep, message=FALSE, error=FALSE, warning=FALSE}
+
+penguins <- na.omit(penguins)
+penguins$is_adelie <- as.numeric(penguins$species=='Adelie')
+train_idx <- sample(nrow(penguins), nrow(penguins)*.7)
+
+
+```
+
+The final setup step is to create a function that converts the data we want into torch tensors.(_side note: this is optional, but recommended way to load data into torch models. When deep learning, you probably can't have all your data in memory at once, and this process helps batch it up_). This code mimics python classes, so it may look a little funky to R users, but just know that the main purpose is to convert data from R datatypes into torch tensors. I've left the helpful comments from [this tutorial on the torch package site](https://mlverse.github.io/torch/articles/examples/dataset.html)
+
+```{r dataconvertfun, message=FALSE, error=FALSE, warning=FALSE}
+
+df_dataset <- dataset(
+  name = "Penguins",
+  
+  # the input data to your dataset goes in the initialize function.
+  # our dataset will take a dataframe and the name of the response
+  # variable.
+  initialize = function(df, feature_variables, response_variable) {
+    
+    # conveniently, the categorical data are already factors
+    df$species <- as.numeric(df$species)
+    df$island <- as.numeric(df$island)
+    
+    self$df <- df[, feature_variables]
+    self$response_variable <- df[[response_variable]]
+  },
+  
+  # the .getitem method takes an index as input and returns the
+  # corresponding item from the dataset.
+  # the index could be anything. the dataframe could have many
+  # rows for each index and the .getitem method would do some
+  # kind of aggregation before returning the element.
+  # in our case the index will be a row of the data.frame,
+  
+  .getitem = function(index) {
+    response <- torch_tensor(self$response_variable[index], dtype = torch_float())
+    x <- torch_tensor(as.numeric(self$df[index,]))
+    
+    # note that the dataloaders will automatically stack tensors
+    # creating a new dimension
+    list(x = x, y = response)
+  },
+  
+  # It's optional, but helpful to define the .length method returning 
+  # the number of elements in the dataset. This is needed if you want 
+  # to shuffle your dataset.
+  .length = function() {
+    length(self$response_variable)
+  }
+  
+)
+
+
+```
+
+
+## Regression
+
+The first regression task is to predict a penguins weight using their other measurements, which island they were observed on, and their species. 
+
+Will this be a very good model? No. The relationship between these variables isn't super strong, I've done no preprocessing, I'm just going through the process of building the model and getting the correct output. When building in real life, absolutely take all those preprocessing steps. Perhaps in a future post I'll show how `torch` models can integrate into a `tidymodels` workflow of some kind.
+
+First, I pass the names of the features and response variables I want through that data conversion function
+
+```{r regbatch, message=FALSE, error=FALSE, warning=FALSE}
+features <- c('bill_length_mm', 'bill_depth_mm', 'flipper_length_mm', 'island', 'species')
+
+response <- 'body_mass_g'
+
+penguins_train <- df_dataset(penguins[train_idx,], 
+                             feature_variables = features, 
+                             response_variable = response)
+
+penguins_test <- df_dataset(penguins[-train_idx,],
+                            feature_variables = features, 
+                            response_variable = response)
+
+```
+
+If I want to look at an example case, here is how you could do that.
+```{r examine, message=FALSE, error=FALSE, warning=FALSE}
+penguins_train$.getitem(1)
+```
+
+Next, I'll pass this converted data through a data loader. This will explicitly batch my data, and be what feeds into the model. You can specify your batch size here. For sake of simplicity, I'm just going to set 10
+
+```{r regdataloader, message=FALSE, error=FALSE, warning=FALSE}
+
+dl_train <- dataloader(penguins_train, batch_size = 10, shuffle = TRUE)
+
+dl_test <-  dataloader(penguins_test, batch_size = 10)
+
+```
+
+What that did was allow me to load 10 cases at a time. It's helpful to get an idea of what that actually looks like. I'll iterate through an example here to show.
+
+```{r iteration, message=FALSE, error=FALSE, warning=FALSE}
+iter <- dl_train$.iter()
+iter$.next()
+
+```
+
+We can see here a single batch of 10 cases. That's what's going to be fed to the model in order to update the weights. If I kept executing `iter$.next()` I'd see the next 10 cases, and so on until I had gone through the entire dataset.
+
+Now, for modeling. The overall structure is a bit different than `tensorflow`, but still intuitive in it's own way.
+
+I'd highly recommend reading Sigrid Keydana's [initial blog post on torch](https://blogs.rstudio.com/ai/posts/2020-09-29-introducing-torch-for-r/) for more info on torch model structure
+
+
+```{r modelspec, message=FALSE, error=FALSE, warning=FALSE}
+
+net <- nn_module(
+  "PenguinNet",
+  initialize = function() {
+    self$fc1 <- nn_linear(length(features), 16)
+    self$fc2 <- nn_linear(16, 8)
+    self$fc3 <- nn_linear(8, 1)
+  },
+  forward = function(x) {
+    x %>% 
+      self$fc1() %>% 
+      nnf_relu() %>% 
+      self$fc2() %>% 
+      nnf_relu() %>%
+      self$fc3() 
+  }
+)
+
+```
+
+
+So first I specify my layers in the `initialize` section, things like layer type, shape, etc. Then I specify the network structure and place those layers within that network in the `forward` section. This is combined in `tensorflow`, which may be a stumbling block for some.
+
+I'll specify the optimizer and assign the network to a model
+
+```{r regoptim,  message=FALSE, error=FALSE, warning=FALSE}
+
+model <- net()
+
+optimizer <- optim_adam(model$parameters)
+
+```
+
+Now comes a part that will likely look different to R users. We're used to a nice tidy (no pun intended) `fit()` function, or that function being wrapped up in something like `lm()`, `randomForest()` etc. With the package in it's infancy (and being a port of PyTorch and borrowing syntax), the fitting is a little more involved. I'm going to set a for loop over the epochs, and explicitly update the model's weights with each pass. This is what is happening under the hood anyway in the functions mentioned above (perhaps without the batching), so it is useful insight into how models in general, and deep learning models in particular, are built.
+
+```{r regmodel, error=FALSE, warning=FALSE}
+
+for (epoch in 1:10) {
+  
+  l <- c()
+  
+  for (b in enumerate(dl_train)) {
+    optimizer$zero_grad()
+    output <- model(b[[1]])
+    loss <- nnf_mse_loss(output,b[[2]])
+    loss$backward()
+    optimizer$step()
+    l <- c(l, loss$item())
+  }
+  
+  cat(sprintf("Loss at epoch %d: %3f\n", epoch, mean(l)))
+  
+}
+
+
+```
+
+Notice how I specified the loss function within that loop (`nnf_mse_loss()`)? Keep an eye on how that changes as we work through the classification models.
+
+So I have my crappy model, now I want to evaluate it on the test set, and pull predictions out so I can make dope visualizations. 
+
+First thing to do is to put the model object in evaluation mode, meaning it won't update the weights anymore and stay as a statis object (i.e. you don't want your linear regression model changing coefficients as you eval on the test set.) That's a simple function 
+
+```{r regfreeze}
+model$eval()
+```
+
+
+For evaluation, I take a similar approach to training, where I loop through the test set, get my loss function, and then aggregate at the end. With a continuous outcome, I'm really only looking at MSE here.
+
+```{r regeval, error=FALSE, warning=FALSE, message=FALSE}
+
+test_losses <- c()
+
+for (b in enumerate(dl_test)) {
+  output <- model(b[[1]])
+  loss <- nnf_mse_loss(output, b[[2]])
+  test_losses <- c(test_losses, loss$item())
+
+}
+
+mean(test_losses)
+
+```
+As I go through the classification examples, I'll show how to specify different loss functions.
+
+And as with any model, it's useless without the output to pass into your production system, visualization models, etc. Extracting the output is simple, even though we have to do some workarounds compared to other packages due to the batching. First, I create an empty prediction vector, and as our cases pass through I populate that vector with the subsequent predictions.
+
+```{r}
+
+preds = c()
+
+for (b in enumerate(dl_test)) {
+  
+  # get predictions
+  output <- model(b[[1]])
+  
+  # convert to vector and append
+  predicted = output$data() %>% as.array() %>% .[,1]
+  preds <- c(preds, predicted)
+  
+  
+}
+
+
+head(preds)
+```
+
+As we can see here, we now have a nice clean vector we can use to in prediction and visualization systems.
+
+That's end-to-end for regression, now let's move onto binary classification.
+
+## Binary Classification
+
+Keeping with the penguins dataset, let's re-use the data loading function from before, and transform the data we want into torch tensors. As there isn't a natural binary variable in this dataset, the outcome is going to be `is_adelie` variable that I created up above. 
+
+```{r bindataloader, error=FALSE, message=FALSE, warning=FALSE}
+
+features <- c('bill_length_mm', 'bill_depth_mm', 'flipper_length_mm', 'body_mass_g')
+
+response <- 'is_adelie'
+
+penguins_train <- df_dataset(penguins[train_idx,], 
+                             feature_variables = features, 
+                             response_variable = response)
+
+penguins_test <- df_dataset(penguins[-train_idx,],
+                            feature_variables = features, 
+                            response_variable = response)
+
+
+```
+
+Now to take a look at a sample case to make sure the data looks correct
+
+```{r bindatacheck, message=FALSE, warning=FALSE, error=FALSE}
+
+penguins_train$.getitem(100)
+
+
+```
+
+Looking good! On to the data loaders...
+
+```{r message=FALSE, warning=FALSE, error=FALSE}
+
+dl_train <- dataloader(penguins_train, batch_size = 10, shuffle = TRUE)
+
+dl_test <-  dataloader(penguins_test, batch_size = 10)
+
+
+```
+
+As this is a classification model, our model structure is going to be mostly the same.
+
+```{r binmodelspec, message=FALSE, error=FALSE, warning=FALSE}
+
+net <- nn_module(
+  "PenguinNet",
+  initialize = function() {
+    self$fc1 <- nn_linear(length(features), 16)
+    self$fc2 <- nn_linear(16, 8)
+    self$fc3 <- nn_linear(8, 1)
+  },
+  forward = function(x) {
+    x %>% 
+      self$fc1() %>% 
+      nnf_relu() %>% 
+      self$fc2() %>% 
+      nnf_relu() %>%
+      self$fc3() 
+  }
+)
+
+
+model <- net()
+
+optimizer <- optim_adam(model$parameters)
+
+```
+ 
+Some may be wondering why I don't have a sigmoid activation at the end of the network. Torch is able to handle that through the loss function. As we see below, I use the `nnf_binary_cross_entropy_with_logits()` loss function, which handles that transformation. Another way to run this model would be to add the sigmoid activation function and use the `nnf_binary_cross_entropy()` function. As is true in all of coding, there are a lot of way to do the same thing.
+
+```{r binmodelrun, message=FALSE, warning=FALSE, error=FALSE}
+
+for (epoch in 1:10) {
+  
+  l <- c()
+  
+  for (b in enumerate(dl_train)) {
+    optimizer$zero_grad()
+    output <- model(b[[1]])
+    loss <- nnf_binary_cross_entropy_with_logits(output,b[[2]])
+    loss$backward()
+    optimizer$step()
+    l <- c(l, loss$item())
+  }
+  
+  cat(sprintf("Loss at epoch %d: %3f\n", epoch, mean(l)))
+  
+}
+
+
+```
+
+Next, the model goes into evaluation mode and we get the test loss
+
+```{r binloss, message=FALSE, warning=FALSE, error=FALSE}
+
+model$eval()
+
+test_losses <- c()
+
+
+for (b in enumerate(dl_test)) {
+  output <- model(b[[1]])
+  loss <- nnf_binary_cross_entropy_with_logits(output, b[[2]])
+  test_losses <- c(test_losses, loss$item())
+}
+
+mean(test_losses)
+
+
+```
+
+Evaluation with classification models need more response vectors than just one (even though they can all be derived from log-odds). The model itself will return log odds, but we can add another vector that returns a class prediction. 
+
+```{r binout, message=FALSE, warning=FALSE, error=FALSE}
+
+# Placeholder vector for predictions
+preds = c()
+
+# Placeholder vector for probabilities
+out_log_odds = c()
+
+for (b in enumerate(dl_test)) {
+  
+  # get log odds
+  output <- model(b[[1]])
+  
+  # convert to df and append
+  log_odds = output$data() %>% as.array() %>% .[,1]
+  out_log_odds <- c(out_log_odds, log_odds)
+  
+  # get class prediction from log odds and append
+  predicted <- as.numeric(log_odds>0)
+  preds <- c(preds, predicted)
+  
+}
+
+
+head(preds)
+
+head(out_log_odds)
+
+
+```
+
+All that puts out log odds, which you can convert into odds ratios and/or probabilities, as well as class predictions at a 50% cutoff. All that can be fed into even more evaluation, confusion matrices, etc.
+
+
+## Multi-Class Classification
+
+Predicting multiple classes is (unsurprisingly) trickier and has more holdups than either of the two previous examples. In this example, I'll be predicting the penguin's species. One thing important to note with multi-class classification is that, contrary to the past two examples, the data type of the outcome variable has to be long, not float. Re-examining the data transformation function from above, we can easily add `dtype = torch_long()` when specifying the outcome variable to account for this
+
+```{r multisetup, error=FALSE, warning=FALSE, message=FALSE}
+
+features <- c('bill_length_mm', 'bill_depth_mm', 'flipper_length_mm', 'body_mass_g')
+
+response <- 'species'
+
+df_dataset <- dataset(
+  name = "Penguins",
+  
+  initialize = function(df, feature_variables, response_variable) {
+    
+    df$species <- as.numeric(df$species)
+    df$island <- as.numeric(df$island)
+    
+    self$df <- df[, feature_variables]
+    self$response_variable <- df[[response_variable]]
+  },
+  
+
+  .getitem = function(index) {
+    
+    response <- torch_tensor(self$response_variable[index], dtype = torch_long()) 
+    x <- torch_tensor(as.numeric(self$df[index,]))
+    
+    list(x = x, y = response)
+  },
+
+  .length = function() {
+    length(self$response_variable)
+  }
+  
+)
+
+
+penguins_train <- df_dataset(penguins[train_idx,], 
+                             feature_variables = features, 
+                             response_variable = response)
+
+penguins_test <- df_dataset(penguins[-train_idx,],
+                            feature_variables = features, 
+                            response_variable = response)
+
+
+```
+
+Now, for a look at the data to make sure the outcome is properly coded.
+
+```{r multicheck, error=FALSE, message=FALSE, warning=FALSE}
+penguins_train$.getitem(100)
+```
+
+With that looking good, the next step is to prep the dataloaders and specify the model structure. Those familiar with deep learning will recognize that I have three nodes on my last layer, which is equal to the number of classes I'm trying to predict. 
+```{r multinet, error=FALSE, message=FALSE, warning=FALSE}
+
+dl_train <- dataloader(penguins_train, batch_size = 10, shuffle = TRUE)
+dl_test <-  dataloader(penguins_test, batch_size = 10)
+
+net <- nn_module(
+  "PenguinNet",
+  initialize = function() {
+    self$fc1 <- nn_linear(length(features), 16)
+    self$fc2 <- nn_linear(16, 8)
+    self$fc3 <- nn_linear(8, 3)
+  },
+  forward = function(x) {
+    x %>% 
+      self$fc1() %>% 
+      nnf_relu() %>% 
+      self$fc2() %>% 
+      nnf_relu() %>%
+      self$fc3()
+  }
+)
+
+```
+ 
+As with the binary classification, I don't have any activations after the last layer, as torch handles those when specifying `nnf_cross_entropy()` into the loss function.
+
+Another important thing to note is that `torch_squeeze()` has to be applied to the labels, or else this loop will error out. As we're working with a multi-class problem, there is an issue with shape, as the model is outputting 3 vectors. What `torch_squeeze()` is gets those vectors into the right format in order to be run with the batching, in our case creating a 10x3 matrix, as our batch size is 10 here.
+
+```{r runmultinet, error=FALSE, message=FALSE, warning=FALSE}
+
+model <- net()
+
+optimizer <- optim_adam(model$parameters)
+
+for (epoch in 1:10) {
+  
+  l <- c()
+  
+  for (b in enumerate(dl_train)) {
+    optimizer$zero_grad()
+    output <- model(b[[1]])
+    loss <- nnf_cross_entropy(output, torch_squeeze(b[[2]]))
+    loss$backward()
+    optimizer$step()
+    l <- c(l, loss$item())
+  }
+  
+  cat(sprintf("Loss at epoch %d: %3f\n", epoch, mean(l)))
+
+}
+
+
+```
+
+After the model is trained, evaluation is the next step. Again, `torch_squeeze()` is necessary to get the output in the right shape. I also pull from Sigrid's into to torch post to add an accuracy metric as well.
+
+```{r multieval, error=FALSE, message=FALSE, warning=FALSE}
+
+# Put the model into eval mode
+model$eval()
+
+test_losses <- c()
+total <- 0
+correct <- 0
+
+for (b in enumerate(dl_test)) {
+  output <- model(b[[1]])
+  labels <- torch_squeeze(b[[2]])
+  loss <- nnf_cross_entropy(output, labels)
+  test_losses <- c(test_losses, loss$item())
+  # torch_max returns a list, with position 1 containing the values 
+  # and position 2 containing the respective indices
+  predicted <- torch_max(output$data(), dim = 2)[[2]]
+  total <- total + labels$size(1)
+  # add number of correct classifications in this batch to the aggregate
+  correct <- correct + (predicted == labels)$sum()$item()
+}
+
+mean(test_losses)
+
+```
+
+Moving on to pulling out the correct output, some adjustments have to be made due to the nature of the multi-class model. Rather than pulling a single vector and working with that, I pull each of the three vectors representing each class's log-odds into a data frame. From that data frame, I extract the class with the highest probability, and use that for our class prediction. 
+
+```{r multipreds, error=FALSE, message=FALSE, warning=FALSE}
+
+
+
+# Placeholder vector for predictions
+preds = c()
+
+# Placeholder df for log odds
+out_log_odds = data.frame()
+
+for (b in enumerate(dl_test)) {
+  
+  # get log odds
+  output <- model(b[[1]])
+
+  # convert to df and append
+  output_df = output$data() %>% as.array() %>% as.data.frame
+  out_log_odds <- rbind(out_log_odds, output_df)
+  
+  # get class prediction from log odds and append (using a 50% cutoff)
+  predicted <- torch_max(output$data(), dim = 2)[[2]]
+  preds <- c(preds, predicted)
+  
+}
+
+
+head(preds)
+
+head(out_log_odds)
+
+
+```
+
+And with that, we've gone through some basic examples of ML model types using tabular data!
+
+
+## Final Thoughts
+
+Hopefully this post demystified some of the code necessary to get Torch up and running, and that the reader will be more comfortable using torch in day to day work, and even build more awesome stuff!
+
+I hope to make this somewhat of a series, where I make examples of making binary/continuous predictions with text/image data, etc. I've used `tensorflow` quite a bit, and often ran into seemingly simple errors. My goal with torch is to have a resource online that'll help others overcome these.
+
+I'm very excited to see Torch develop within the R community. Binding directly to the C++ libraries is going to pay dividends, as it removed the step of managing python environments within R. First, it's going to be fun to see libraries like `torchtext` and `pyro` get ported over and used within R. Second, I think this setup makes it likely that we'll see some R torch libraries get created that will have to be ported over to Python. The RStudio team absolutely crushed it with this port, and I'm excited to see how they and the R community at large continue to build on this.
